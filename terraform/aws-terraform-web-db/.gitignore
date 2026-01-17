@@ -1,0 +1,20 @@
+# .gitignore
+
+# --- Terraform ---
+*.tfstate
+*.tfstate.*
+.terraform/
+terraform.tfvars
+*.backup
+crash.log
+
+# Optional: lock file for providers (can include if working in a team)
+.terraform.lock.hcl
+
+# --- Editor / System Files ---
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db

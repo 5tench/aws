@@ -1,0 +1,183 @@
+﻿#!/bin/bash
+# -------------------------------------------------------------------------
+# Script: compare-sg-final.sh
+# Purpose: Compare two AWS Security Groups and output detailed audit reports
+# Usage: ./compare-sg-final.sh <sg-id-1> <sg-id-2> [region]
+# Example: ./compare-sg-final.sh sg-AAAA1111 sg-BBBB2222 us-east-1
+# Notes:
+#   - Read-only, safe for auditing
+#   - Requires: aws CLI, jq
+#   - All output files go to ~/sg_audit_reports
+#   - Includes metadata, full JSON, flattened rules, differences, comparison
+# -------------------------------------------------------------------------
+
+set -euo pipefail
+
+# ------------------------------
+# Input validation
+# ------------------------------
+if [ $# -lt 2 ]; then
+    echo "Usage: $0 <sg-id-1> <sg-id-2> [region]"
+    exit 1
+fi
+
+SG1=$1
+SG2=$2
+REGION=${3:-us-east-1}
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+
+# ------------------------------
+# Output directory
+# ------------------------------
+OUTPUT_DIR=~/sg_audit_reports
+mkdir -p "$OUTPUT_DIR"
+
+# ------------------------------
+# Output filenames
+# ------------------------------
+METADATA_FILE="$OUTPUT_DIR/metadata-${TIMESTAMP}.txt"
+SG1_FULL="$OUTPUT_DIR/sg1-full-${TIMESTAMP}.json"
+SG2_FULL="$OUTPUT_DIR/sg2-full-${TIMESTAMP}.json"
+SG1_INGRESS="$OUTPUT_DIR/sg1-ingress-${TIMESTAMP}.txt"
+SG1_EGRESS="$OUTPUT_DIR/sg1-egress-${TIMESTAMP}.txt"
+SG2_INGRESS="$OUTPUT_DIR/sg2-ingress-${TIMESTAMP}.txt"
+SG2_EGRESS="$OUTPUT_DIR/sg2-egress-${TIMESTAMP}.txt"
+SG_DIFF="$OUTPUT_DIR/sg-diff-${TIMESTAMP}.txt"
+SG_INGRESS_DIFF="$OUTPUT_DIR/sg-ingress-diff-${TIMESTAMP}.txt"
+SG_EGRESS_DIFF="$OUTPUT_DIR/sg-egress-diff-${TIMESTAMP}.txt"
+SG_COMPARISON="$OUTPUT_DIR/sg-comparison-report-${TIMESTAMP}.txt"
+
+# ------------------------------
+# Map protocol + ports to Type
+# ------------------------------
+map_type() {
+    proto=$1
+    from=$2
+    to=$3
+
+    if [ "$proto" == "tcp" ]; then
+        case "$from-$to" in
+            22-22) echo "SSH" ;;
+            443-443) echo "HTTPS" ;;
+            80-80) echo "HTTP" ;;
+            25-25) echo "SMTP" ;;
+            *) echo "Custom TCP" ;;
+        esac
+    elif [ "$proto" == "udp" ]; then
+        echo "Custom UDP"
+    elif [ "$proto" == "-1" ]; then
+        echo "All Protocols"
+    else
+        echo "$proto"
+    fi
+}
+
+# ------------------------------
+# Generate flattened rule file
+# ------------------------------
+generate_flat_file() {
+    local json_file=$1
+    local out_file=$2
+    local direction=$3
+
+    # Header
+    printf "%-15s %-10s %-10s %-25s %-50s\n" "TYPE" "PROTOCOL" "PORT_RANGE" "SOURCE" "DESCRIPTION" > "$out_file"
+
+    local perms
+    if [ "$direction" == "Ingress" ]; then
+        perms=$(jq -c '.IpPermissions[]?' "$json_file")
+    else
+        perms=$(jq -c '.IpPermissionsEgress[]?' "$json_file")
+    fi
+
+    if [ -z "$perms" ]; then
+        return
+    fi
+
+    while IFS= read -r perm; do
+        proto=$(echo "$perm" | jq -r '.IpProtocol')
+        from=$(echo "$perm" | jq -r '.FromPort // -1')
+        to=$(echo "$perm" | jq -r '.ToPort // -1')
+        type=$(map_type "$proto" "$from" "$to")
+        cidrs=$(echo "$perm" | jq -r '.IpRanges[]?.CidrIp // "-"')
+        descs=$(echo "$perm" | jq -r '.IpRanges[]?.Description // "-"')
+
+        OLDIFS=$IFS
+        IFS=$'\n'
+        i=0
+        for cidr in $cidrs; do
+            desc=$(echo "$descs" | sed -n "$((i+1))p")
+            port_range="$from-$to"
+            printf "%-15s %-10s %-10s %-25s %-50s\n" "$type" "$proto" "$port_range" "$cidr" "$desc" >> "$out_file"
+            ((i++))
+        done
+        IFS=$OLDIFS
+    done <<< "$perms"
+
+    # Sort by port
+    (head -n1 "$out_file"; tail -n +2 "$out_file" | sort -k3n,3 -k4) > tmpfile && mv tmpfile "$out_file"
+}
+
+# ------------------------------
+# Fetch SG JSON from AWS
+# ------------------------------
+aws ec2 describe-security-groups --group-ids "$SG1" --region "$REGION" --output json | jq -S '.SecurityGroups[]' > "$SG1_FULL"
+aws ec2 describe-security-groups --group-ids "$SG2" --region "$REGION" --output json | jq -S '.SecurityGroups[]' > "$SG2_FULL"
+
+# ------------------------------
+# Generate flattened ingress/egress files
+# ------------------------------
+generate_flat_file "$SG1_FULL" "$SG1_INGRESS" "Ingress"
+generate_flat_file "$SG1_FULL" "$SG1_EGRESS" "Egress"
+generate_flat_file "$SG2_FULL" "$SG2_INGRESS" "Ingress"
+generate_flat_file "$SG2_FULL" "$SG2_EGRESS" "Egress"
+
+# ------------------------------
+# Raw JSON diff
+# ------------------------------
+diff -u "$SG1_FULL" "$SG2_FULL" > "$SG_DIFF" || true
+
+# ------------------------------
+# Ingress / Egress diffs
+# ------------------------------
+diff -u "$SG1_INGRESS" "$SG2_INGRESS" > "$SG_INGRESS_DIFF" || true
+diff -u "$SG1_EGRESS" "$SG2_EGRESS" > "$SG_EGRESS_DIFF" || true
+
+# ------------------------------
+# Generate metadata
+# ------------------------------
+{
+    echo "Security Group Comparison Metadata"
+    echo "Timestamp: $TIMESTAMP"
+    echo "Region: $REGION"
+    echo "SG1: $SG1"
+    echo "SG2: $SG2"
+    echo "Files generated:"
+    ls -1 "$OUTPUT_DIR"
+} > "$METADATA_FILE"
+
+# ------------------------------
+# Generate SG comparison report
+# ------------------------------
+{
+    echo "SG Comparison Report"
+    echo "===================="
+    echo ""
+    echo "Only in SG1 (rules missing in SG2):"
+    comm -23 <(tail -n +2 "$SG1_INGRESS" | sort) <(tail -n +2 "$SG2_INGRESS" | sort)
+    echo ""
+    echo "Only in SG2 (rules missing in SG1):"
+    comm -13 <(tail -n +2 "$SG1_INGRESS" | sort) <(tail -n +2 "$SG2_INGRESS" | sort)
+    echo ""
+    echo "Shared rules:"
+    comm -12 <(tail -n +2 "$SG1_INGRESS" | sort) <(tail -n +2 "$SG2_INGRESS" | sort)
+    echo ""
+    echo "Rules to apply to SG2 to match SG1:"
+    comm -23 <(tail -n +2 "$SG1_INGRESS" | sort) <(tail -n +2 "$SG2_INGRESS" | sort)
+} > "$SG_COMPARISON"
+
+# ------------------------------
+# Completion message
+# ------------------------------
+echo "âœ… SG comparison complete. All files in $OUTPUT_DIR"
+

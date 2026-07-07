@@ -3,7 +3,7 @@
 # Script: compare-sg-final.sh
 # Purpose: Compare two AWS Security Groups and output detailed audit reports
 # Usage: ./compare-sg-final.sh <sg-id-1> <sg-id-2> [region]
-# Example: ./compare-sg-final.sh sg-AAAA1111 sg-BBBB2222 us-east-1
+# Example: ./compare-sg-final.sh sg-xxxxxxxxxxxxxxxxx sg-yyyyyyyyyyyyyyyyy us-east-1
 # Notes:
 #   - Read-only, safe for auditing
 #   - Requires: aws CLI, jq
@@ -180,4 +180,3 @@ diff -u "$SG1_EGRESS" "$SG2_EGRESS" > "$SG_EGRESS_DIFF" || true
 # Completion message
 # ------------------------------
 echo "âœ… SG comparison complete. All files in $OUTPUT_DIR"
-
